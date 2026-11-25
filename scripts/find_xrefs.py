@@ -1,11 +1,31 @@
-"""Find direct CALL/JMP xrefs to a target VA in GenshinImpact.exe (7.2)."""
+"""Find direct CALL/JMP xrefs to a target VA in a PE.
+
+Usage:  python find_xrefs.py <target.exe> [VA]
+        TARGET_PE=<target.exe> python find_xrefs.py -- <VA>
+"""
+import os
 import struct
 import sys
+from pathlib import Path
 
 import pefile
 
-EXE = r"C:\Program Files\HoYoPlay\games\Genshin Impact game\GenshinImpact.exe"
-target = int(sys.argv[1], 16) if len(sys.argv) > 1 else 0x141634160
+def _require_path(value, what, env_name):
+    """Resolve a path from argv/env, or stop with a usage line."""
+    if value:
+        p = Path(value)
+        if p.exists():
+            return str(p)
+        raise SystemExit(f"{what} not found: {p}")
+    raise SystemExit(
+        f"usage: pass the {what} path as an argument or set {env_name}\n"
+        f"  e.g.  python {Path(__file__).name} <{what}>")
+
+_args = [a for a in sys.argv[1:] if a != "--"]
+_exe = _args[0] if _args and not _args[0].lower().startswith("0x") else os.environ.get("TARGET_PE", "")
+EXE = _require_path(_exe, "target executable", "TARGET_PE")
+_va = next((a for a in _args if a.lower().startswith("0x")), "0x141634160")
+target = int(_va, 16)
 
 data = open(EXE, "rb").read()
 pe = pefile.PE(data=data, fast_load=True)

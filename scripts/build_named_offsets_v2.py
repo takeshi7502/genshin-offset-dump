@@ -7,10 +7,21 @@ import sys
 
 import pefile
 
+def _require_path(value, what, env_name):
+    """Resolve a path from argv/env, or stop with a usage line."""
+    if value:
+        p = Path(value)
+        if p.exists():
+            return str(p)
+        raise SystemExit(f"{what} not found: {p}")
+    raise SystemExit(
+        f"usage: pass the {what} path as an argument or set {env_name}\n"
+        f"  e.g.  python {Path(__file__).name} <{what}>")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
-OLD_DUMP = r"D:\GENSHIN\dump\dump.cs"
-EXE = r"C:\Program Files\HoYoPlay\games\Genshin Impact game\GenshinImpact.exe"
-IDA_DB = r"D:\GENSHIN\dump\Genshin_v7.i64"
+OLD_DUMP = _require_path(os.environ.get("OLD_DUMP", ""), "old dump.cs", "OLD_DUMP")
+EXE = _require_path(os.environ.get("TARGET_PE", ""), "target executable", "TARGET_PE")
+IDA_DB = _require_path(os.environ.get("OLD_IDA_DB", ""), "old IDA database", "OLD_IDA_DB")
 OUT = os.path.join(HERE, "named_offsets_v2.json")
 NLEN = 48
 LIMIT = int(sys.argv[1]) if len(sys.argv) > 1 else 0

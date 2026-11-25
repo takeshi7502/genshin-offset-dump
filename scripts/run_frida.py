@@ -9,6 +9,8 @@ import os
 import sys
 import time
 
+from pathlib import Path
+
 import frida
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,7 +36,9 @@ def main():
 
     device = frida.get_local_device()
     if args.spawn:
-        exe = r"C:\Program Files\HoYoPlay\games\Genshin Impact game\GenshinImpact.exe"
+        exe = os.environ.get("TARGET_PE", "")
+    if not exe or not Path(exe).exists():
+        raise SystemExit("set TARGET_PE to the game executable, or pass --spawn-exe")
         pid = device.spawn([exe])
         print(f"[+] spawned pid={pid}")
     elif args.pid:

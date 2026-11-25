@@ -5,10 +5,21 @@ import struct
 
 import pefile
 
+def _require_path(value, what, env_name):
+    """Resolve a path from argv/env, or stop with a usage line."""
+    if value:
+        p = Path(value)
+        if p.exists():
+            return str(p)
+        raise SystemExit(f"{what} not found: {p}")
+    raise SystemExit(
+        f"usage: pass the {what} path as an argument or set {env_name}\n"
+        f"  e.g.  python {Path(__file__).name} <{what}>")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "named_offsets_verified.json")
 OUT = os.path.join(HERE, "named_offsets_unique.json")
-EXE = r"C:\Program Files\HoYoPlay\games\Genshin Impact game\GenshinImpact.exe"
+EXE = _require_path(os.environ.get("TARGET_PE", ""), "target executable", "TARGET_PE")
 NLEN = 48
 
 

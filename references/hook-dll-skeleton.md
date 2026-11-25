@@ -1,117 +1,146 @@
-# Skeleton DLL an toàn cho Genshin (headless, IPC-driven)
+# Host DLL skeleton — inert load, IPC-driven work
 
-Mẫu này là bản đã chạy ổn định: **load xong không đụng gì vào game**, mọi thao tác qua IPC.
-Đây là cách duy nhất tránh "Not Responding" khi vào world.
+This is the shape that keeps a modded client alive: the DLL touches nothing at load time and
+every engine operation happens later, on request, from the right thread. It is an *example*
+of the constraints in `SKILL.md` §7, not a requirement to copy verbatim.
 
-## 1. Nguyên tắc
+## 1. Lifecycle rules
 
 ```
-DllMain  -> chỉ GetModuleHandleA + LogLine + spawn thread IPC
-        -> TUYỆT ĐỐI không: GetTypeInfo, MH_*, scan, hook
-IPC cmd  -> mới được: scan / install hook / remove hook
-Hook     -> chỉ cài khi game đã vào world
+DllMain        -> GetModuleHandle (module base) + spawn thread + return
+                  NEVER: engine calls, symbol resolution, hooking, scanning, allocation
+worker thread  -> open IPC pipe, serve commands, run per-tick bookkeeping
+game thread    -> every engine call, drained from a per-frame callback
 ```
 
-## 2. DllMain tối thiểu
+Why: `DllMain` runs under the loader lock. Doing anything that waits for another thread, or
+that triggers the CRT/loader (static init, `std::thread` join, `LoadLibrary`) deadlocks. The
+visible result is a client that freezes during startup or on the first area load.
+
+## 2. Minimal `DllMain`
 
 ```cpp
+static HMODULE g_self = nullptr;
+static uintptr_t g_base = 0;
+static volatile bool g_running = true;
+
 BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
-        gi_tool::paths::setModuleHandle(h);
+        g_self = h;
+        g_base = (uintptr_t)GetModuleHandleW(nullptr);   // host image
         DisableThreadLibraryCalls(h);
-        g_base = (uintptr_t)GetModuleHandleA("GenshinImpact.exe");  // chỉ lấy base
-        LogLine("[dll] inert load base=0x%llX", (unsigned long long)g_base);
-        std::thread(ipcThread).detach();
+        CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        g_running = false;
     }
     return TRUE;
 }
 ```
 
-## 3. Đọc bộ nhớ an toàn
+`g_base` via `GetModuleHandleW(nullptr)` — never a hardcoded base, never assume the module
+name matches something you saw in a dump.
 
-```cpp
-static void* readPtrSafe(void* addr) {
-    __try { return *(void**)addr; } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-}
-static const char* safeCstr(void* p) {
-    if (!p) return "";
-    __try {
-        const char* s = *(const char**)p;
-        if (!s) return "";
-        volatile char c = *s; (void)c;              // force fault here
-        return (strlen(s) < 200) ? s : "";
-    } __except (EXCEPTION_EXECUTE_HANDLER) { return ""; }
-}
+## 3. Worker loop shape
+
+```
+WorkerThread:
+    diag::Init(true)                  # log file, session header, module bases
+    ResolveAnchors()                  # optional: verify/repair RVAs at startup
+    StartPipeServer()                 # commands arrive here
+    loop while running:
+        refresh state connected to the chain (cheap, read-only)
+        run feature ticks that ONLY enqueue
+        sleep ~8 ms
+    stop pipe, remove hooks, close log
 ```
 
-`__try` **không** đặt trong hàm có `std::string`/`std::ofstream` (lỗi C2712).
-Tách thành helper thuần raw rồi gọi từ hàm có object.
+Nothing in this loop may call engine code directly. Ticks that need the engine enqueue an
+intent (`thread-and-reentrancy.md` §1).
 
-## 4. Pool hook generic (chỉ đếm)
-
-Cần N detour tĩnh vì MinHook yêu cầu con trỏ hàm cố định:
+## 4. Safe memory access
 
 ```cpp
-struct DynHook { uintptr_t rva = 0; void* orig = nullptr; std::atomic<int> hits{0}; };
-static std::vector<DynHook*> g_dynHooks;
-
-// sinh 128 hàm tường minh (đừng dùng macro token-paste với biểu thức)
-#define DET(i) \
-static uintptr_t __fastcall dynDet##i() { \
-    auto* h = (i < (int)g_dynHooks.size()) ? g_dynHooks[i] : nullptr; \
-    using F = uintptr_t(__fastcall*)(); \
-    uintptr_t r = (h && h->orig) ? reinterpret_cast<F>(h->orig)() : 0; \
-    if (h) h->hits++; \
-    return r; }
-```
-
-Gọi original **không tham số** vẫn an toàn trên x64: các thanh ghi tham số (RCX/RDX/R8/R9/XMM)
-không bị detour chạm tới.
-
-## 5. Cài / gỡ hook
-
-```cpp
-static bool hookOne(uintptr_t rva) {
-    if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) return false;
-    void* target = (void*)(g_base + rva);
-    auto* h = new DynHook(); h->rva = rva;
-    int idx = (int)g_dynHooks.size();
-    if (MH_CreateHook(target, g_dynDet[idx], &h->orig) != MH_OK) { delete h; return false; }
-    if (MH_EnableHook(target) != MH_OK) { MH_RemoveHook(target); delete h; return false; }
-    g_dynHooks.push_back(h);
+static bool ReadMem(uintptr_t addr, void* out, size_t n) {
+    if (!addr || !out || !n) return false;
+    __try { memcpy(out, (const void*)addr, n); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return true;
 }
+template <typename T> bool ReadVal(uintptr_t a, T& v) { return ReadMem(a, &v, sizeof(T)); }
 ```
 
-## 6. IPC protocol (named pipe, message mode)
+Rules:
 
-Pipe: `\\.\pipe\GITool_IPC`
+- `__try` must not appear in a function that has objects needing unwinding (`std::string`,
+  `std::ofstream`, `std::thread`) — MSVC error C2712. Put the SEH in a small raw helper and
+  call it from the larger function.
+- Every hop of every chain goes through this. One unguarded dereference is a crash on a
+  null or a poisoned pointer (`0xFFFFFFFFFFFFFFFF`).
+- Validate a handle by reading one field through this before trusting it, even if a function
+  just returned it.
 
-| Lệnh | Trả lời | Tác dụng |
-|---|---|---|
-| `PING` | `OK` | test |
-| `STATE` | chuỗi `k=v;...` | telemetry |
-| `CLASSES` | `OK:SCANNING ...` | bắt đầu quét async |
-| `GETCLASSES` | `OK;Name1;Name2;...` | lấy kết quả |
-| `METHODS <Class>` | `OK;0:0xRVA;1:0xRVA;...` | liệt kê method |
-| `HOOK_RVA 0x...` | `OK` / `ERR:*` | hook 1 method (chỉ đếm) |
-| `HOOK_CLASS <Class>` | `OK:HOOKED_CLASS ok=N` | hook cả class |
-| `UNHOOK_ALL` | `OK:ALL_REMOVED` | gỡ hết |
-| `HOOKSTATS` | `OK;0xRVA=hits;...` | counter |
-| `RELOAD_CONFIG` | `OK:RELOAD_QUEUED` | đọc lại config file |
+## 5. Hook engine expectations
 
-Server loop: `CreateNamedPipeW` → `ConnectNamedPipe` → `ReadFile` → dispatch → `WriteFile` →
-`FlushFileBuffers` → `DisconnectNamedPipe` → `CloseHandle` → lặp.
+Whatever inline-hook implementation you use, it must:
+
+- decode instruction boundaries to relocate a prologue (minimum ~14 bytes for a 64-bit
+  absolute jump), not just copy 5 bytes;
+- refuse to hook a `E9` thunk without following it (or follow it for you);
+- relocate RIP-relative operands when the trampoline is beyond ±2 GB;
+- fail loudly (`installed`, `failed`, reason) and be logged.
+
+A self-test that hooks two local functions, checks both directions (detour sees the call,
+trampoline returns the original result) and removes them cleanly, catches most engine bugs
+before the game does. Keep it in CI/build.
+
+## 6. Pipe protocol
+
+Keep it line-delimited JSON with one reply per request. Minimum surface for offset work:
+
+| Command | Purpose |
+|---|---|
+| `probe_chain` | verdict per hop of the pointer chain |
+| `get_state` | counters, hook count, in-world, tick time |
+| `set_config {...}` | feature configuration; must log what it parsed |
+| `set_entity_array` / `set_local_entity` | manual override from the offset page |
+| `read_ptr` / `mem_dump` | inspect one address (bounded size) |
+| `field_probe` | shape-test candidate field offsets |
+| `scan_arrays` (optional) | rediscovery path when the chain is lost |
+
+Implementation notes:
+
+- One reader thread, serialised handlers. Never call engine code from the pipe thread —
+  enqueue instead, then wait for the result with a short timeout and return it.
+- Replies must be single-line JSON so a client can read by line.
+- Log every command at `INFO` with its parsed effect (`instrumentation.md` §3).
 
 ## 7. Config bus
 
-`artifacts/local_config.txt`, format `key=value` mỗi dòng.
-Launcher ghi file rồi gửi `RELOAD_CONFIG`; DLL đọc lại. Không cần JSON.
+Two options, both fine:
 
-## 8. Checklist trước khi bật bất kỳ hook nào
+- **Push**: the host serialises config into one JSON line and sends it on change.
+- **Pull**: the host writes a config file and sends `reload`; the core reads the file.
 
-- [ ] Game đã ở **menu chính hoặc trong world**
-- [ ] `verify_candidates.py` báo `func = YES`
-- [ ] byte đầu không phải `E9` thunk
-- [ ] hook chỉ **đếm** trước, xem hit > 0 rồi mới sửa logic
-- [ ] có `UNHOOK_ALL` để thoát nhanh nếu game lag
+Prefer push for latency and pull as a fallback when the pipe is not up yet. Either way, log
+the parsed values — never log only "config applied".
+
+## 8. Shutdown
+
+```
+on detach: stop queueing -> unhook all -> stop pipe -> close log
+```
+
+Order matters: unhook before tearing down state the detours read, otherwise a detour runs
+once against freed memory. If a clean shutdown is impossible (host process is exiting), do
+nothing in `DLL_PROCESS_DETACH` except set the flag — the process is going away anyway.
+
+## 9. Pre-flight checklist
+
+- [ ] `DllMain` contains no engine work, no static objects requiring init, no waits.
+- [ ] All chain reads go through SEH-guarded helpers.
+- [ ] Every engine call happens on the game thread, via the queue.
+- [ ] Detours are reentrancy-guarded and contain no engine calls.
+- [ ] Hook engine self-test passes.
+- [ ] Every command is logged with its parsed effect.
+- [ ] A disable path exists for every hook and every queue.
+- [ ] Log file flushes `INFO` lines so a hard crash leaves evidence.

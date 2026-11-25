@@ -1,438 +1,382 @@
 ---
-name: genshin-7x-offset-dump
-description: Dump and recover IL2CPP class/method offsets for Genshin Impact 7.x on Windows (encrypted MHY metadata, hidden exports) using static marker scanning, Ghidra MCP, Frida runtime struct reversing, IDA Database bytecode matching across versions, and safe MinHook integration. Use when the task is to find RVAs for game functions, recover method names, or build/repair a Genshin offset dumper or hook DLL.
+name: genshin-offset-dump
+description: General method for discovering, verifying and wiring game offsets — code RVAs and struct field offsets — in a native IL2CPP/Unity target (Genshin and similar), starting from whatever artifacts exist (the target binary, a decompiled second tool, an old dump, a live process). Covers evidence levels L0-L4, slot-table harvesting, pointer-chain reconstruction instead of heap scanning, thread/reentrancy discipline, instrumentation you must add before blaming features, in-process overlay drawing, and a symptom→cause failure atlas. Use when a task is "find the offset for X", "why does this feature do nothing", "port feature Y from tool Z", or "the game crashes / hangs after inject".
 ---
 
-# Genshin 7.x — IL2CPP offset dump & recovery
+# Offset discovery — the general method
 
-Skill này ghi lại **toàn bộ quy trình đã chạy thành công** trên Genshin 7.2.0 (Windows, x64).
-Mọi bước đều có script thật trong `scripts/`. Đọc hết phần "Bẫy" trước khi hook.
+This is a **process**, not a table of numbers. Numbers rot on every patch; the process
+does not. Treat any RVA you read here or anywhere else as a *hint* until it passes the
+verification ladder below.
 
----
+Three rules govern everything else:
 
-## 0. Sự thật nền tảng (đọc trước, tránh mất vài ngày)
-
-| Điều | Thực tế trên 7.2.0 |
-|---|---|
-| `global-metadata.dat` | Magic `4D 48 59 00` = `"MHY\0"` → **encrypted**, không phải IL2CPP chuẩn. Il2CppDumper/MetadataConverter2 bản cũ **fail** (`Invalid signature: 0x...`). |
-| Export IL2CPP | Từ 3.2 **đã bị ẩn hết** (`il2cpp_*` không còn export). |
-| `GameAssembly.dll` | **Không còn**. Code IL2CPP compile thẳng vào `GenshinImpact.exe` (~451 MB). |
-| Metadata trong RAM | **Không tìm thấy plaintext** (scan `AF1BF1FF`, `FAB11BAF`, `MHY\0` → 0 hit). Nghĩa là header bị xử lý riêng, đừng mất thời gian scan magic. |
-| Tên method trong RAM | **Không có plaintext**. Scan `DoHitEntity`, `CalcDamage`, `VCHumanoidMove`… → 0 hit. Metadata string table bị mã hoá. |
-| `il2cpp_class_get_name` / `method_get_name` | **Không tìm được bằng xref string**. Các hàm quanh marker string đều là error formatter, gọi vào là AV. Đừng phí thời gian. |
-| `s_TypeInfoTable` | Vẫn tồn tại, là **global pointer** trong `.data`, không phải symbol. Tìm qua decompile hàm getter. |
-| Cấu trúc class | **Shuffled**: `klass = TypeInfo + 0x08`, `name = *(klass + 0x88)`, method entry nằm **inline tại `klass + 0x100`, stride `0x38`**. `klass+0x18` là **typedef index**, KHÔNG phải method count. |
-
-> Kết luận: chỉ có 3 đường sống — (A) static marker scan + Ghidra, (B) Frida gọi API runtime,
-> (C) bytecode matching từ IDA DB của bản cũ. Phải dùng **cả 3**.
+1. **Evidence over guesswork.** An offset is only as good as the level it was verified
+   at. Never wire a feature to an offset below L3 (see §2).
+2. **Synthesise before you scan.** Most games still hold the root pointer you need in a
+   static data slot. Enumerating slots beats scanning the heap, every time.
+3. **Instrument before you blame.** If you cannot see a function being called, a config
+   being applied, or a memory access faulting, you are guessing. Add the instrumentation
+   first (§8).
 
 ---
 
-## 1. Inventory công cụ (đường dẫn thật trên máy này)
+## 1. Vocabulary that keeps you honest
 
-| Tool | Path | Dùng để |
+Confusing these five is the most common cause of "it doesn't work".
+
+| Term | Meaning | Verified by |
 |---|---|---|
-| Ghidra 12.1.4 + GhidraMCP 7.0.0 | `C:\Tools\ghidra_12.1.4_PUBLIC\ghidraRun.bat`, plugin HTTP `127.0.0.1:8089` | decompile, xref, tìm hàm quanh string |
-| JDK 21 | `C:\Tools\jdk-21.0.13+9` | Ghidra |
-| IDA Pro 9.1 + `idalib` | `D:\PHAN_MEM\IDA 9.1 Pro\idalib\python` | export bytecode hàm bản cũ |
-| IDA DB bản cũ | `D:\GENSHIN\dump\Genshin_v7.i64` | nguồn bytecode để match |
-| Frida (python) | `python -m pip show frida` (16.5.9) | attach/spawn, gọi API runtime |
-| Python packages | `pefile`, `capstone`, `frida`, `pycryptodome` | scan PE, disasm, runtime |
-| VS 2022 Community | `...\Common7\Tools\VsDevCmd.bat` | build DLL hook (cl.exe) |
-| MinHook | `vendor\minhook\lib\libMinHook.x64.lib` | hook |
-| ImGui 1.92.x | `vendor\imgui` | overlay/launcher GUI |
+| **Code RVA** | Address of a function, relative to the module base | L1+L2 (`.pdata`, thunk follow, prologue) |
+| **Field offset** | Byte offset inside an object, e.g. `entity+0x3D4 = config id` | shape test + read-back (§6) |
+| **Slot** | A static data qword that *stores* a code RVA or an object pointer | dereference + section check |
+| **Thunk** | A 5-byte `E9 rel32` stub that jumps to the real body | thunk follow; hook the target, not the stub |
+| **Chain** | A fixed sequence of dereferences from a static address to the object you need | one verdict per hop (§6) |
 
-Biến môi trường cho idalib:
-```powershell
-$env:PYTHONPATH='D:\PHAN_MEM\IDA 9.1 Pro\idalib\python'
-$env:IDADIR='D:\PHAN_MEM\IDA 9.1 Pro'
-```
+Two more that matter in practice:
+
+- **Root pointer** — the module-level pointer everything hangs off (the `GlobalVars`
+  analogue). Find it once and most other offsets become trivial.
+- **Shape test** — a cheap predicate that a candidate pointer *looks like* the object you
+  want (readable, dense pointer array, a count field in range, an id that resolves back
+  through a known accessor). Shape tests are how you avoid scanning for a needle.
 
 ---
 
-## 2. Phase 0 — Recon
+## 2. The evidence ladder
 
-```powershell
-# version game
-Get-Content 'C:\Program Files\HoYoPlay\games\Genshin Impact game\config.ini'
-# file chính
-Get-ChildItem 'C:\Program Files\HoYoPlay\games\Genshin Impact game' | ft Name,Length
-```
+Every offset climbs these levels *in order*. A level is a gate, not a memo.
 
-Cần lấy: `game_version` (vd `7.2.0`), kích thước `GenshinImpact.exe`, và xác nhận
-`GenshinImpact_Data\Managed\Metadata\global-metadata.dat` có magic `4D 48 59 00`.
+| Level | Claim | How to test | Failure looks like |
+|---|---|---|---|
+| **L0** | The address is inside a mapped section of *this* build | PE/ELF section table: is the RVA in a code/data section? | RVA from an old patch lands in padding or another section |
+| **L1** | It is a real function entry, not mid-instruction | Exception directory (`.pdata` on x64) or symbol table contains it; when that table is encrypted, fall back to prologue+boundary and treat the result as *soft* | Caught a mid-function RVA: `0x1F9E20` "worked" as a viewport getter and faulted; the real entry was `0x1A2522D0`, a thunk to `0x146A280` |
+| **L2** | It is not a thunk; prologue sane; argument shape known | Follow `E9 rel32` to the final target; read the first instructions and every call site in the disassembly to see what each parameter dereferences | Hooking `set_targetFrameRate` at `0x146C6C0` (a `E9` stub) installs a hook that never runs |
+| **L3** | It can be called from the right thread with the right arguments without faulting | Call it from a controlled probe and check for faults + plausible return | Fault every time: wrong thread, or the first argument must be a class/static pointer, not an RVA |
+| **L4** | It produces the intended observable effect in game | Measure state before/after, not the return value | "Returned OK" but the monster still has full HP: you wrote *damage* into an *HP* field and healed it |
 
-**ImageBase của exe = `0x140000000`.** Mọi "RVA" trong tài liệu = `VA - 0x140000000`.
+Practical consequence: keep a ledger (`scripts/offset_ledger.py`). If an entry sits at L2
+and nobody tested it, mark the feature `partial` in the UI instead of claiming it works.
 
 ---
 
-## 3. Phase 1 — Static marker scan (không cần chạy game)
+## 3. Phase A — inventory before you touch anything
 
-Mục tiêu: tìm RVA của các string đặc trưng, rồi tìm hàm reference chúng.
+Collect and *record* these. Missing any one of them costs hours later.
 
-### 3.1 Marker string đã biết (7.2.0)
+- [ ] **Target binary** — exact file, its size, version string, image base, section table.
+- [ ] **Second artifact with labels** — an older build's dump, a decompiled copy of a
+      different tool for the same game, a public symbol file, a `.i64`/Ghidra project.
+      This is usually the single highest-value input (§5).
+- [ ] **Decompiled sources** — even a mid-quality Ghidra dump of *another* implementation
+      gives you argument shapes and call sites you cannot get from a stripped binary.
+- [ ] **A live process** you may attach to, and a known-good state (in game, in world).
+- [ ] **An existing config/schema** — the field names a tool already uses tell you which
+      features exist and what the code expects (useful as a checklist, never as truth).
+- [ ] **How you will observe** — a log file you control, a probe command, a read-back.
 
-| API đích | String marker | RVA string |
+Write the inventory into the repo (a `docs/` file), not into chat.
+
+---
+
+## 4. Phase B — build the RVA map
+
+Do B2 first. It is by far the cheapest.
+
+### B1. Static, from the target binary
+`scripts/pe_tool.py sections <pe>` then `scripts/pe_tool.py verify <pe> spec.txt`.
+Marker-string scanning and bytecode matching (see `references/static-analysis.md`) give
+*candidates*; they do not prove the function does what its name suggests.
+
+### B2. Harvest a slot table from a labelled artifact  ← highest ROI
+Tools routinely store every game function pointer in static data slots and call them
+through that slot. If you have a decompiled copy of any such tool:
+
+1. Locate the slot region in **its** binary (dense qwords whose values are code RVAs).
+2. Dump `slot -> stored RVA`.
+3. For each slot, find which decompiled function reads it — that names the RVA by
+   *behaviour*, not by guesswork.
+4. Verify every harvested RVA against **your** target binary (B1). RVAs move; slot shapes
+   do not.
+
+`scripts/pe_tool.py slotmap <bin> <start> <end> --src <decompiled-dir>` does all four.
+Worked example and the reasoning: `references/slot-tables.md`.
+
+### B3. Cross-version matching
+When names are encrypted but you hold an old dump with names, match normalised prologue
+bytes (mask rel32/disp32/imm64 before comparing, then keep only signatures that are
+unique). See `references/static-analysis.md` §4.
+
+### B4. Decide, don't accumulate
+Produce a short candidate list per feature with a *reason* for each. Ten reasoned
+candidates beat two hundred scanned addresses.
+
+---
+
+## 5. Phase C — reconstruct the chain, don't scan the heap
+
+Heap scanning is a last resort and it is unreliable: the array address changes every
+session, and a stale pointer is a crash. Prefer this order:
+
+1. **Enumerate static slots.** Walk the data section for qwords that point into readable
+   memory; shape-test each candidate.
+2. **Fetch the game's own view of the world.** Most engines expose a root object reachable
+   from a module-level pointer. Verify it by asking the engine to validate it (a
+   `bool in_world(root)` style call) rather than by inspecting bytes.
+3. **Walk from an object you can already identify.** Local player → component list →
+   entity list is a common and stable shape.
+4. **Only then** scan memory, and when you do, adopt the result as a *cache with a
+   re-discovery path*, never as the single source of truth.
+
+Document the chain as a first-class artifact — one line per hop, each with its own
+verdict:
+
+```
+base                = module base
+root                = *(base + SLOT)              # root pointer, must be non-null
+world               = *(root + OFF_WORLD)         # validated by engine call
+avatar              = *(root + OFF_AVATAR)        # +OFF_CFGID = own id
+list                = *(avatar + OFF_LIST)        # +0x18 count, +0x10 array
+entry(i)            = *(array + HEADER + i*8)
+```
+
+Details, shape tests and the "one verdict per hop" probe format:
+`references/pointer-chains.md`.
+
+---
+
+## 6. Phase D — runtime verification
+
+Design probes so one command answers one question, and make the answer *machine
+readable*. A good probe returns, per hop: the value, and a boolean for "this hop is
+healthy". Then a broken offset is obvious from the verdict line instead of requiring a
+debug session.
+
+Rules:
+
+- **Read back after every write.** Write position → read position. Write HP → read HP.
+  If the read-back is unchanged, the write went somewhere harmless and the "feature"
+  is a no-op, not a bug in the UI.
+- **Prefer the engine's own action.** If the engine has `Pickup(mgr, id)`, call it. Do not
+  emulate it by mutating fields — you will desynchronise a state machine.
+- **Never mutate timing/tick fields of a stateful object to "skip" something.** Zeroing a
+  dialogue object's timing fields parked its state machine at the last line forever.
+  Send the same input the player would send instead.
+- **Distrust any single observation.** Take a baseline, act, re-measure.
+
+---
+
+## 7. Phase E — call discipline (the four rules)
+
+These four rules account for nearly every "it does nothing" and nearly every hang.
+
+### Rule 1 — engine calls belong to the engine's thread
+IL2CPP and most engine APIs are not thread-safe. A worker thread that calls
+object-allocating APIs will occasionally fault, deadlock, or silently do nothing.
+
+Pattern: the worker **enqueues** intent; a per-frame callback that already runs on the
+game thread **drains** the queue. Any per-frame callback works (`Present`, an input
+dispatch, a tick detour) — pick one that always runs on that thread, and never drain from
+a UI-thread callback.
+
+### Rule 2 — a detour must never re-enter itself
+Resolve and cache anything the detour needs on another thread *before* the detour runs.
+If you must call game code from inside a detour, guard it (`thread_local` or an atomic
+exchange) — one hook that resolved a component handle inside its own detour recursed
+until the client hung.
+
+### Rule 3 — queue identities, not pointers
+An entity pointer observed on the worker thread may be freed before the game thread uses
+it. Queue the stable id (config id / instance id) and re-resolve on the consuming thread.
+
+### Rule 4 — arguments are found, not assumed
+Given `f(a, b, c)`, the same signature can mean `(entity)`, `(component)`,
+`(staticObject)`, `(classPointer)` or `(configId)`. Resolve by:
+1. Reading the disassembly for what `a` dereferences (`[rcx+0x20]` implies an object).
+2. Reading every call site in the decompiled reference tool.
+3. Testing both candidate shapes in one instrumented run and comparing the log.
+
+A real example where all three mattered: the damage-result factory took a **class
+pointer read from a global**, not an RVA and not a static address — every other shape
+faulted.
+
+Reference: `references/thread-and-reentrancy.md`.
+
+---
+
+## 8. Phase F — instrumentation you add *first*
+
+Add these before debugging any feature. Without them you cannot tell "not called" from
+"called and failed" from "called and ignored".
+
+1. **First-chance access-violation logger** — a vectored handler that records the faulting
+   RVA, the accessed address and the thread id, deduped per RVA per second. Engine code
+   swallows many faults; without this, a "silent" feature looks like a logic bug.
+2. **Per-line thread id in the log** — a hang and a wrong-thread call look identical
+   without it.
+3. **A log line for every config apply, at a level your config cannot disable.** A
+   `logging=false` default once turned off the very traces needed to diagnose it.
+4. **Session header** with build timestamp, module bases, and the patch under test.
+5. **Harness hygiene:** when a test harness passes structured arguments through a shell,
+   quoting is lost silently. Write the command to a file and read it; then log what the
+   receiver actually parsed. Two "the core ignores my command" investigations were
+   PowerShell eating quotes.
+
+Reference: `references/instrumentation.md`.
+
+---
+
+## 9. Phase G — drawing in-process (only if the task needs an overlay)
+
+A separate topmost layered window over a flip-model swap chain can make the game's
+`Present` block and the client stop pumping messages. Draw **into the game's frame**
+instead, from the `Present`/`Present1` hook:
+
+- Query `IDXGISwapChain3::GetCurrentBackBufferIndex()` — buffer 0 is not always current.
+- **Set your own viewport** and restore the previous one. The engine may leave a partial
+  viewport bound, which clips anything in a corner and makes you think your draw failed.
+- When cropping a bitmap, **repack rows** — the pitch you upload must match the width you
+  claim, or the texture is garbage.
+- Set the alpha channel explicitly; GDI leaves it at zero, so a fully opaque plate blends
+  to invisible.
+- Keep one texture atlas for all text and draw per-item quads from it.
+
+Full checklist with the failure each item prevents: `references/in-process-overlay.md`.
+
+---
+
+## 10. Wiring order per feature
+
+Never jump from "found an RVA" to "user-visible toggle". Go in this order, and stop at
+the first step that fails — that is where the bug is.
+
+1. **Read** the value the feature needs, and log it while the player does the thing.
+2. **Verify the read** matches reality (position moves, id is stable, count is plausible).
+3. **Write once**, then read back and log both.
+4. **Verify the effect** with an independent observation (entity disappears, HP decreases,
+   camera FOV changes) — not the function's return value.
+5. Only then expose the toggle, with the UI status reflecting the *highest level reached*
+   (`working` = L4 observed, `partial` = L2/L3, `unavailable` = no path).
+
+If a feature is `partial`, say so in the UI. An honest `partial` costs nothing; a false
+`working` costs the reporter an afternoon.
+
+---
+
+## 11. Failure atlas — symptom, cause, test
+
+| Symptom | Most likely cause | Test that distinguishes it |
 |---|---|---|
-| `MetadataCache::GetTypeInfoFromTypeDefinitionIndex` | `because generic types cannot have explicit layout.` | `0x3AD08AB` |
-| `Class::GetName` / `GetNamespace` | `must be instantiated using the ScriptableObject.CreateInstance method instead of new %s.` | `0x3B80B90` |
-| `method name` path | `Script error (%s): %s.\n` | `0x3B5DBD8` |
-| field enum | `value__` | `0x3AC1756` |
-| method ctor | `ConstructorInfo` | `0x3AA3AE2` |
-| field info | `FieldInfo` | `0x3AA3E9F` |
+| Hook installs, hit count 0 | Hooked a thunk, or the wrong function | `pe_tool.py thunk` + verify the target is called in the disassembly |
+| Feature does nothing, no errors | Called from a worker thread; engine ignores it | Log the thread id at the call site; compare to a known per-frame callback |
+| Feature does nothing but the log says OK | Wrote to the wrong field (e.g. damage into HP) | Read back the field before/after |
+| All engine calls after some action start failing | Fault inside a queue item left state broken | First-chance AV logger, look at the last RVA before the failures |
+| Client hangs ("Not Responding") after inject | Recursion inside a detour, or a blocking call on the UI thread | Look for game calls inside detours; check for a layered topmost window |
+| Overlay draws (per logs) but nothing appears | Partial viewport, wrong buffer index, pitch mismatch, or zero alpha | Draw a large solid quad first: if it shows, the textured path is at fault |
+| Values look like garbage after a read | Wrong struct layout assumption | Dump the object's first 0x100 bytes and look for a plausible shape |
+| Works once, breaks after the target dies | Queued a pointer instead of an id | Re-resolve from id on the consuming thread |
+| Config never reaches the core | Harness quoting / wrong field name | Log the parsed values inside the receiver |
+| Random crashes only in combat | Unvalidated handle used directly | Validate handle by reading one field through SEH first |
 
-### 3.2 Chạy
-
-```powershell
-python scripts\scan_offsets_v2.py      # range-aware, RIP-relative + imm
-python scripts\scan_offsets_static.py  # exact match + .pdata function mapping
-```
-
-Script làm gì:
-1. `pefile` load exe, đọc `.pdata` (exception directory) → danh sách **1.19M function start**.
-2. Tìm string marker → RVA.
-3. Quét mọi section executable tìm instruction RIP-relative (`REX + opcode + modrm(0x05) + disp32`)
-   và `movabs imm64` trỏ tới string (cho phép ±0x10 để bắt string bị split).
-4. Map instruction → function start gần nhất bằng bisect trên `.pdata`.
-5. Ghi `offsets_v2.json`.
-
-> **Chỉ tin function start từ `.pdata`**, đừng dùng heuristic "quét ngược tới 0xCC" — trên binary này
-> nó trả về giữa hàm.
-
-### 3.3 Giới hạn của bước này
-Trên 7.2, marker scan tìm được nhiều hàm nhưng **không phân biệt được hàm nào là API thật**.
-Vì vậy bước này chỉ để **lấy ứng viên**, phải validate bằng runtime (Phase 3).
+More, with the reasoning behind each: `references/failure-atlas.md`.
 
 ---
 
-## 4. Phase 2 — Ghidra MCP (decompile + xref)
+## 12. Definition of done
 
-### 4.1 Import exe (chỉ 1 lần, KHÔNG bật auto-analysis cho nhanh)
+A feature is done when all of these are true, and the report says which are not:
 
-```powershell
-New-Item -ItemType Directory -Force -Path 'D:\GENSHIN\dump7.2\ghidra_proj' | Out-Null
-& 'C:\Tools\ghidra_12.1.4_PUBLIC\support\analyzeHeadless.bat' `
-  'D:\GENSHIN\dump7.2\ghidra_proj' 'GI72' `
-  -import 'C:\Program Files\HoYoPlay\games\Genshin Impact game\GenshinImpact.exe' `
-  -noanalysis
-```
+- Every offset it uses is in the ledger at the level claimed, with the patch it was tested on.
+- The effect was observed independently, at least once, and the observation is reproducible.
+- The failure mode when the target is absent (not in world, entity gone, no avatar) is a
+  clean no-op, not a crash.
+- The UI status matches reality.
+- The log contains enough to diagnose it next time (thread, verdict, values).
 
-`.pdata` được Ghidra dùng để tạo **1.14M function** ngay cả khi không auto-analyze. Đủ để decompile.
-
-### 4.2 Bật MCP
-
-```powershell
-Start-Process -FilePath 'C:\Tools\ghidra_12.1.4_PUBLIC\ghidraRun.bat' `
-  -ArgumentList 'D:\GENSHIN\dump7.2\ghidra_proj\GI72.gpr'
-```
-Kiểm tra: `curl http://127.0.0.1:8089/check_connection`.
-Nếu MCP client báo "no instance": gọi `connect_instance({project:"GI72"})` rồi `open_program({path:"/GenshinImpact.exe"})`.
-
-### 4.3 Dùng
-
-```
-analyze_function_complete({function:"0x14051D860"})
-search_strings({search_term:"value__"})        # sẽ rỗng nếu chưa auto-analyze
-get_xrefs_to({addresses:"0x143AD08AB"})        # cũng rỗng nếu chưa analyze
-```
-
-> **Bẫy:** khi chưa auto-analyze, `search_strings` và `get_xrefs_to` **trả rỗng** dù string có thật.
-> Vẫn decompile được từng hàm theo address (nhờ `.pdata`). Đừng kết luận "không có xref".
-> Muốn string/xref đầy đủ thì phải chạy `run_analysis` (rất lâu với 451 MB).
-
-### 4.4 Cách đọc decompile để tìm đúng API
-
-Ví dụ tìm `GetTypeInfoFromTypeDefinitionIndex`:
-1. String `because generic types cannot have explicit layout.` ở RVA `0x3AD08AB`.
-2. Scan static ra nhiều ứng viên, trong đó có hàm đọc `lRam...8f20 + index*8` và gọi
-   `FUN_...527830` → đúng là MetadataCache.
-3. Decompile `FUN_140527E20`: thấy `*(qword*)(table + idx*8)` → đây là hàm trả `TypeInfo*`.
-
-**Quy tắc vàng:** hàm trả `TypeInfo*` phải có pattern
-`mov rax, [rip+X]` → `mov rax, [rax + rcx*8]` → `ret` (hoặc cache table).
-Ứng viên nào có XOR/sub constant lạ → nhiều khả năng không phải.
+Report format: what changed · evidence level reached · what was actually run · what is
+unverified and why.
 
 ---
 
-## 5. Phase 3 — Frida: validate & reverse struct runtime
+## 13. Quickstart — the whole loop for one feature
 
-### 5.1 Chạy game + attach
+Copy, adapt paths, and do not skip the gates.
 
-```powershell
-# spawn (game chưa chạy)
-python scripts\run_frida.py frida_dump_clean.js --spawn --seconds 180
-# attach (game đang chạy)
-python scripts\run_frida.py frida_hook_observe.js --pid <PID> --seconds 60
+```bash
+S=scripts                      # this skill's scripts directory
+PE=<target binary>
+
+# 1. shape of the target
+python $S/pe_tool.py sections $PE
+
+# 2. candidate RVAs: harvest from any labelled artifact, then verify on THIS build
+python $S/pe_tool.py slotmap <labelled-binary> 0x1F8000 0x1FAA00 \
+        --src <decompiled-dir> --json slots.json
+#    write the ones you care about into spec.txt as  name=0xRVA  and:
+python $S/pe_tool.py verify $PE spec.txt --json verify.json
+#    -> OK / THUNK(use the suggested address) / SOFT-OK / FAIL. Obey it.
+
+# 3. record what you now believe, and at which level
+python $S/offset_ledger.py set ledger.json --name FeatureFn --rva 0x123456 \
+        --kind code --level L2 --source "slot 0x... + verify" --patch <patch>
+
+# 4. read the argument shape, do not guess it
+python $S/pe_tool.py disasm $PE 0x123456 --len 96
+
+# 5. chain, not scan (when the feature needs an object)
+#    implement probe_chain: one verdict per hop, plus one live value
+
+# 6. wire it: engine calls on the game thread, ids not pointers, no engine calls in detours
+
+# 7. prove the effect, then raise the level
+python $S/offset_ledger.py bump ledger.json --name FeatureFn --level L4 \
+        --note "target entity removed within 3 s, game responsive 30 s"
 ```
 
-`run_frida.py` inject biến `CANDIDATES` từ file JSON trước khi load script,
-nên có thể truyền danh sách RVA mà không sửa JS.
+If step 2 returns `SOFT-OK`, remember that it is a heuristic verdict: it must pass an L3
+call test before it may be wired to anything.
 
-### 5.2 Validate một API có đúng không
+## 14. Adapting to a different target
 
-Dùng `frida_validate.js` / `frida_test_apis3.js`:
-- Gọi hàm với `int` 0,1,2,10 → nếu trả pointer đọc được và `+0x20` có tên → đúng.
-- **Bắt buộc dùng đúng kiểu object**: `GetTypeInfo` nhận `int`; `class_get_*` nhận `klass` (KHÔNG phải `TypeInfo`).
+The method is not tied to one game or one engine.
 
-Kết quả đã xác nhận trên 7.2.0:
-```
-GetTypeInfoFromTypeDefinitionIndex = RVA 0x527E20
-  f(0) = 0x500010aefb8  (TypeInfo*)
-```
-
-### 5.3 Cấu trúc runtime đã reverse được (7.2.0)
-
-```
-TypeInfo* ti = GetTypeInfo(i);        // RVA 0x527E20
-klass        = *(void**)(ti + 0x08);
-name         = *(char**)(klass + 0x88);     // "Locale", "CodePointIndexer"
-typedefIndex = *(u64*)(klass + 0x18);       // KHÔNG phải method count
-methods      = inline tại klass + 0x100, mỗi entry 0x38 byte
-codeRVA      = *(void**)(entry + 0x00) - gameBase
-```
-
-Kiểm chứng: `GetTypeInfo(0)` → `klass=0x500010aeeb0`, name `"Locale"`;
-`GetTypeInfo(100)` → `"CodePointIndexer"`; `GetTypeInfo(1000)` → `"Array"`.
-
-> **Bẫy cực quan trọng:** `klass+0x30` trông như pointer array nhưng thực chất là vùng
-> overlap. Dùng `klass+0x30` + stride `0x38` sẽ cho RVA rác (66 triệu dòng sau 30k class).
-> **Phải dùng `klass + 0x100` + stride `0x38`.**
-> `klass+0x18` là typedef index (513, 516, 519…) — dùng làm method count sẽ sinh rác.
-
-### 5.4 Dump sạch
-
-```powershell
-python scripts\run_frida.py frida_dump_clean.js --spawn --seconds 200
-# -> dump_clean.cs : ~200k class / ~494k method RVA
-```
-
-Kiểm tra: chỉ giữ code pointer nằm trong **code section**:
-```
-.text  : 0x1000 .. 0x21D2200
-il2cpp : 0x6D2B000 .. 0x1A400000
-```
-Đây là 2 section chứa code của Genshin 7.2 (lấy bằng `pefile`).
-
-### 5.5 Nếu cần dump có kiểm soát (không treo)
-Tuyệt đối **không** gọi `GetTypeInfo` từ thread phụ lúc game đang load/đang vào world.
-Chỉ scan khi:
-- game đã ở menu chính hoặc đã vào world,
-- và nên chạy async (thread riêng trả kết quả dần), không block thread render.
-
----
-
-## 6. Phase 4 — Phục hồi TÊN method (bytecode matching)
-
-Vì tên method bị mã hoá, không đọc trực tiếp được. Cách duy nhất đã chứng minh hiệu quả:
-**so khớp bytecode hàm giữa IDA DB bản cũ và binary bản mới.**
-
-### 6.1 Ý tưởng
-- Bản cũ (7.0) có `Genshin_v7.i64` + `dump.cs` (có tên + RVA).
-- Bản mới (7.2) có binary nhưng không tên.
-- Hàm không đổi → bytecode giống nhau → match được.
-
-### 6.2 Pipeline
-
-```powershell
-# B1: index function start của 7.2 từ .pdata + normalized signature
-# B2: mở IDA DB, export 48 byte đầu mỗi hàm 7.0, so khớp
-$env:PYTHONPATH='D:\PHAN_MEM\IDA 9.1 Pro\idalib\python'
-$env:IDADIR='D:\PHAN_MEM\IDA 9.1 Pro'
-python scripts\build_named_offsets_v2.py 0
-# -> named_offsets_v2.json  (16.292 match)
-```
-
-### 6.3 Normalize (bắt buộc, nếu không sẽ 0 match)
-
-Mask các byte phụ thuộc vị trí trước khi so sánh:
-- `E8/E9 rel32` (call/jmp) → mask 4 byte sau opcode
-- `0F 8x rel32` (jcc) → mask 4 byte
-- `REX + modrm(0x05) + disp32` (RIP-relative) → mask 4 byte
-- `REX + B8..BF + imm64` (movabs) → mask 8 byte
-
-Nếu không mask: match rate ~0.9%. Có mask: ~2.5% trên toàn bộ 648k method → **16.292 tên**.
-(Mỗi hàm chỉ cần 48 byte đầu; đủ đặc trưng.)
-
-### 6.4 Lọc false positive (bắt buộc)
-
-16.292 match có nhiều cái trùng signature giữa nhiều hàm (hàm nhỏ, prologue giống nhau).
-
-```powershell
-python scripts\filter_unique_offsets.py
-# -> named_offsets_unique.json : 4.394 match duy nhất
-```
-
-Nguyên tắc: với mỗi signature, đếm số function 7.2 có cùng signature; **chỉ giữ khi đếm == 1**.
-
-### 6.5 Kết quả đáng tin (ví dụ 7.2.0)
-```
-EntityActor::GetPosX                  0x769D330
-EntityActor::TickInternal             0x122B4A50
-MonoStaminaInfo::set_maxStamina       0x10A8DE50
-VCHumanoidMove::JIDHLNCONOE           0x9CB6230
-DSCharacterEntity::IsInPreJumpState   0x72DBBE0
-LevelTimeManager::remove_OnHourPassed 0x7D120C0
-```
-
-### 6.6 Giới hạn
-- Hàm nào bị recompile/đổi code → không match.
-- Tên trong `dump.cs` bản cũ **cũng có thể đã obfuscate** (vd `JIDHLNCONOE`) → match được tên nhưng
-  không hiểu nghĩa. Khi đó phải dùng Phase 7 (runtime counting).
-- Tuyệt đối **không** copy offset từ repo khác; nếu có hint thì chỉ dùng để **verify**
-  (`verify_candidates.py`), không tin mù.
-
----
-
-## 7. Phase 5 — Verify RVA trước khi hook
-
-```powershell
-python scripts\verify_candidates.py
-```
-
-Script in cho từng RVA:
-- `func = YES/NO` — có nằm trong `.pdata` không
-- 16 byte đầu
-
-**Điều kiện để hook:**
-1. `func = YES`
-2. byte đầu là prologue: `40 53`, `48 89 5c 24`, `56 57`, `41 57`, `48 83 ec`, `55 41 57`…
-3. **KHÔNG** phải `E9 xx xx xx xx` (thunk) — nếu là thunk thì resolve:
-   `target = rva + 5 + int32(bytes[1:5])`
-
-Ví dụ thực tế: `Application::set_targetFrameRate` hint `0x146C6C0` chỉ là thunk
-→ hàm thật `0x16BA230`.
-
----
-
-## 8. Phase 6 — Tìm ngữ nghĩa hàm bằng runtime counting
-
-Khi đã có RVA nhưng không biết hàm làm gì:
-
-1. Hook **chỉ đếm** (không sửa return) cho cả class:
-   ```cpp
-   // pool 128 detour, mỗi detour: gọi original, tăng counter, trả nguyên kết quả
-   ```
-2. Vào world, làm **đúng 1 hành động** (đánh 1 lần / chạy / nhặt 1 món / dùng E-Q).
-3. Counter RVA nào tăng → đó là hàm của hành động đó.
-4. Gỡ hook trước khi thử class khác.
-
-Đây là cách duy nhất xác định được semantic khi tên bị obfuscate.
-
----
-
-## 9. Phase 7 — Hook an toàn (bài học đắt)
-
-### 9.1 Không bao giờ hook lúc load
-Gọi `GetTypeInfo` hoặc `MH_CreateHook` từ thread phụ ngay khi DLL load →
-**deadlock, game "Not Responding" khi vào world**. Đã gặp thật.
-
-Quy tắc:
-- `DllMain`: chỉ `GetModuleHandleA`, mở pipe, spawn thread. **Không chạm game.**
-- Inject **sau khi đã vào world**.
-- Mọi thao tác game qua lệnh IPC do người dùng bấm.
-
-### 9.2 Mẫu hook MinHook
-
-```cpp
-using PresentFn = HRESULT(WINAPI*)(IDXGISwapChain*, UINT, UINT);
-static PresentFn g_origPresent = nullptr;
-
-static HRESULT WINAPI det_Present(IDXGISwapChain* sw, UINT sync, UINT flags) {
-    /* ... */
-    return g_origPresent(sw, sync, flags);
-}
-
-MH_Initialize();
-MH_CreateHook(reinterpret_cast<void*>(g_base + RVA), det_Present,
-              reinterpret_cast<void**>(&g_origPresent));
-MH_EnableHook(MH_ALL_HOOKS);   // hoặc enable từng cái
-```
-
-### 9.3 Mẫu "chặn damage" (GodMode)
-```cpp
-// Combat::SetHP(void* combatProp, float newHp, void* method)
-using SetHpFn = void(__fastcall*)(void*, float, void*);
-static SetHpFn g_origSetHp = nullptr;
-static void __fastcall det_SetHp(void* prop, float hp, void* m) {
-    if (features().godMode) return;          // bỏ qua set HP -> không nhận damage
-    g_origSetHp(prop, hp, m);
-}
-```
-
-### 9.4 Mẫu "sửa damage" (One Punch)
-```cpp
-// CalcDamage(a1, a2, AttackResult* res, a4, method)
-static void __fastcall det_Calc(void* a1, void* a2, void* res, void* a4, void* m) {
-    if (features().onePunch && res)
-        *(float*)((uintptr_t)res + 0x14C) *= features().damageMultiplier; // offset 7.2
-    g_origCalc(a1, a2, res, a4, m);
-}
-```
-
-### 9.5 Mẫu gọi thẳng hàm game (không hook)
-```cpp
-// Time::set_timeScale(float, void* method) @ RVA 0x1448A20
-using Fn = void(__fastcall*)(float, void*);
-reinterpret_cast<Fn>(g_base + 0x1448A20)(2.0f, nullptr);
-```
-
-### 9.6 Quy tắc chống crash
-| Sai | Hậu quả |
-|---|---|
-| Override return của `Tick`/`LateTick`/`Update` | treo game ngay |
-| Gọi hàm IL2CPP từ thread phụ lúc load | deadlock |
-| Hook hàm thunk `E9` | hook sai chỗ, không bao giờ chạy |
-| Gọi `GetTypeInfo` 100k lần đồng bộ trên thread render | giật/treo |
-| Đọc pointer không SEH | crash khi gặp null/`0xffffffff` |
-
-Luôn bọc đọc bộ nhớ:
-```cpp
-static void* readPtrSafe(void* addr) {
-    __try { return *(void**)addr; } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-}
-```
-**Không đặt `__try` trong hàm có `std::string`/`std::ofstream`** (C2712) → tách hàm helper thuần raw.
-
----
-
-## 10. Artifact checklist sau khi dump xong
-
-| File | Nội dung |
-|---|---|
-| `dump_clean.cs` | class + method RVA (không tên) |
-| `named_offsets_v2.json` | RVA ↔ tên (16k) |
-| `named_offsets_unique.json` | chỉ match duy nhất (4.4k) — **dùng cái này** |
-| `FEATURE_OFFSETS.md` | bảng RVA theo chức năng |
-| `verify_candidates.py` output | xác nhận hàm thật/thunk |
-
----
-
-## 11. Bảng lỗi thường gặp
-
-| Triệu chứng | Nguyên nhân | Cách sửa |
+| Target | What changes | What stays |
 |---|---|---|
-| `Invalid signature: 0x...` khi decrypt metadata | metadata 4.8+ đổi format | Bỏ hướng decrypt, dùng runtime |
-| 0 hit khi scan `AF1BF1FF` / `MHY` | metadata không plaintext trong RAM | Bỏ hướng scan metadata |
-| 0 hit khi scan tên method | tên bị mã hoá | Dùng Phase 6 bytecode match |
-| GetTypeInfo trả null ở mọi index | chưa vào world / metadata chưa init | Đợi vào world rồi mới scan |
-| Hook cài xong nhưng hit = 0 | hook nhầm thunk hoặc nhầm hàm | `verify_candidates.py` lại |
-| Game "Not Responding" khi vào world | scan/hook từ thread phụ lúc load | Chỉ thao tác sau khi vào world |
-| 66 triệu method RVA rác | dùng `klass+0x30` thay vì `klass+0x100` | Sửa base offset |
-| Ghidra `get_xrefs_to` rỗng | chưa auto-analyze | Decompile theo address, hoặc chạy analysis |
+| Another IL2CPP/Unity title | Metadata layout, class stride, slot names | Section table → candidates → verify → chain → thread discipline |
+| A title with symbols or a public SDK | Start at L2 with the symbol; skip name recovery | Evidence levels, chain verification, read-back |
+| A non-Unity native game | No IL2CPP plumbing at all; more work on struct layout | Slot harvesting, thunk follow, probes, instrumentation, failure atlas |
+| Console / emulator targets | Address translation differs (no PE) | Everything conceptual: ladder, round-trip writes, thread rules |
+
+The two things that never transfer by copying are **offsets** and **struct layouts**. The
+two things that always transfer are the **ladder** and the **diagnostic discipline**.
 
 ---
 
-## 12. Thứ tự thực thi tóm gọn
+## References
 
-```
-0. Recon           -> version, file sizes, metadata magic
-1. Marker scan     -> scripts\scan_offsets_v2.py
-2. Ghidra import   -> analyzeHeadless -noanalysis + GUI/MCP
-3. Decompile       -> xác định GetTypeInfo (0x527E20) và struct layout
-4. Frida validate  -> frida_validate.js, frida_test_apis3.js
-5. Dump runtime    -> frida_dump_clean.js  -> dump_clean.cs
-6. Tên method      -> build_named_offsets_v2.py -> filter_unique_offsets.py
-7. Verify RVA      -> verify_candidates.py
-8. Tìm ngữ nghĩa   -> hook class đếm hit khi chơi
-9. Hook thật       -> MinHook, sau khi vào world
-```
+| File | Read it when |
+|---|---|
+| `references/static-analysis.md` | Building candidates from a binary; marker scan, `.pdata`, thunk follow, cross-version bytecode matching |
+| `references/slot-tables.md` | You have any second artifact with labels and want a labelled RVA map fast |
+| `references/pointer-chains.md` | You need the entity/player/world chain, or a root pointer, or you are tempted to scan the heap |
+| `references/thread-and-reentrancy.md` | Before writing any hook or any engine call |
+| `references/instrumentation.md` | Before debugging your first failing feature |
+| `references/in-process-overlay.md` | The task needs ESP/FPS/menu drawn over the game |
+| `references/failure-atlas.md` | Something does not work and you do not know where to look |
+| `references/hook-dll-skeleton.md` | You need a working host-DLL + IPC shape to hang everything off |
+| `references/case-notes.md` | You want one worked example — what the protection removed, and which bugs were process failures |
+
+## Scripts
+
+| Script | Purpose |
+|---|---|
+| `pe_tool.py` | `sections`, `verify` (L0/L1/L2 verdicts), `thunk`, `disasm`, `slotmap` |
+| `offset_ledger.py` | Durable record of every offset with its evidence level and patch |
+| `scan_offsets_v2.py`, `scan_offsets_static.py` | Marker-string scans for IL2CPP plumbing candidates |
+| `verify_candidates.py` | Legacy per-RVA prologue check (superseded by `pe_tool.py verify`) |
+| `build_named_offsets_v2.py`, `filter_unique_offsets.py`, `export_ida_bytes.py` | Cross-version bytecode matching to recover names |
+| `run_frida.py`, `frida_*.js` | Runtime validation, struct layout, controlled dumps |
+| `find_xrefs.py`, `map_method_names2.py` | Locating cross-references in a dump |
+
+All scripts are read-only against the target. They never patch a file and never require
+the game to be running except the Frida ones.
